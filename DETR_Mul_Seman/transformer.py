@@ -68,32 +68,32 @@ def gen_sineembed_for_position(pos_tensor):
     return pos
 
 
-class PAN(nn.Module):
-    def __init__(self, lvl, channels):
-        super().__init__()       
-        self.conv = nn.Conv2d(channels, channels, kernel_size = 3, stride = 3, padding = 0)
-        self.feat_proj_list = nn.ModuleList()
-        self.l = lvl
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for i in range(lvl):
-            self.feat_proj_list.append(nn.Linear(int(channels * math.pow(2, (i + 1))), channels))
-        self.feat_proj_list.to(device)
-        
-    def forward(self, feat, feat_maps):
-
-        feat_pyramid = [feat]
-        for i in range(self.l - 1):
-            f = F.interpolate(feat_pyramid[i], scale_factor=2, mode='bilinear', align_corners=False) + self.feat_proj_list[i](feat_maps[self.l - i - 1])
-            feat_pyramid.append(f)
-
-        output = [feat_pyramid[-1]]
-        for i in range(self.l - 1):
-            output.append(output[i] + self.conv(feat_pyramid[self.l - i]))
-
-
-        return output
-
-
+#class PAN(nn.Module):
+#    def __init__(self, lvl, channels):
+#        super().__init__()       
+#        self.conv = nn.Conv2d(channels, channels, kernel_size = 3, stride = 3, padding = 0)
+#        self.feat_proj_list = nn.ModuleList()
+#        self.l = lvl
+#        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#        for i in range(lvl):
+#            self.feat_proj_list.append(nn.Linear(int(channels * math.pow(2, (i + 1))), channels))
+#        self.feat_proj_list.to(device)
+#        
+#    def forward(self, feat, feat_maps):
+#
+#        feat_pyramid = [feat]
+#        for i in range(self.l - 1):
+#            f = F.interpolate(feat_pyramid[i], scale_factor=2, mode='bilinear', align_corners=False) + self.feat_proj_list[i](feat_maps[self.l - i - 1])
+#            feat_pyramid.append(f)
+#
+#        output = [feat_pyramid[-1]]
+#        for i in range(self.l - 1):
+#            output.append(output[i] + self.conv(feat_pyramid[self.l - i]))
+#
+#
+#        return output
+#
+#
 class Transformer(nn.Module):
 
     def __init__(self, d_model=512, nhead=8, num_queries=300, num_encoder_layers=6,
@@ -296,56 +296,55 @@ class TransformerDecoder(nn.Module):
                 query_sine_embed[..., self.d_model // 2:] *= (refHW_cond[..., 0] / obj_center[..., 2]).unsqueeze(-1)
                 query_sine_embed[..., :self.d_model // 2] *= (refHW_cond[..., 1] / obj_center[..., 3]).unsqueeze(-1)
 
-            p = PAN(3, self.d_model)
-            pan_feats = p(memory, feat_maps) 
-            #mul_feat = []
-            ##mul_feat = feat_maps[(layer_id//2)]
-            ##we also need to use different masks here! 
-            #if layer_id < 2:
-            #    mul_feat.append(feat_maps[(layer_id//2)])
-            #    mul_spatial_shape = mul_feat[0].shape
-            #    mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
-            #    mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
-        #
-            #    resized_memory = F.interpolate(memory, [mul_spatial_shape[2], mul_spatial_shape[3]], mode='bilinear', align_corners=False)# Double the spatial size
-            #    resized_memory = resized_memory.flatten(2).permute(2, 0, 1)
-            #    resized_memory = mul_feat + resized_memory
-#
-            #    memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
-            #    pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
-#
-            #elif layer_id < 4:
-            #    mul_feat.append(feat_maps[(layer_id//2)])
-            #    mul_spatial_shape = mul_feat[0].shape
-            #    mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
-            #    mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
-#
-            #    resized_memory = F.interpolate(memory, [mul_spatial_shape[2], mul_spatial_shape[3]], mode='bilinear', align_corners=False)
-            #    resized_memory = resized_memory.flatten(2).permute(2, 0, 1)
-            #    resized_memory = mul_feat + resized_memory
-#
-            #    memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
-            #    pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
-#
-            #else:
-            #    mul_feat.append(feat_maps[(layer_id//2)])
-            #    mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
-            #    mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
-#
-            #    resized_memory = memory.flatten(2).permute(2, 0, 1)
-            #    
-            #    resized_memory =  mul_feat + resized_memory #we should notice the feature map contains in a upside down manner.
-            #    memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
-            #    pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
-#
-            #    
-        #
-            ##mul_feat = mul_feat.flatten(2).permute(2, 0, 1)
-            ##mul_feat_pos = self.feat_input_proj_pos[(layer_id//2)](mul_feat)
-            ##mul_feat_mem = self.feat_input_proj_mem[(layer_id//2)](mul_feat)
+            #p = PAN(3, self.d_model)
+            #pan_feats = p(memory, feat_maps) 
+            mul_feat = []
+            #mul_feat = feat_maps[(layer_id//2)]
+            #we also need to use different masks here! 
+            if layer_id < 2:
+                mul_feat.append(feat_maps[(layer_id//2)])
+                mul_spatial_shape = mul_feat[0].shape
+                mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
+                mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
+        
+                resized_memory = F.interpolate(memory, [mul_spatial_shape[2], mul_spatial_shape[3]], mode='bilinear', align_corners=False)# Double the spatial size
+                resized_memory = resized_memory.flatten(2).permute(2, 0, 1)
+                resized_memory = mul_feat + resized_memory
 
+                memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
+                pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
 
-            output = layer(output, pan_feats[layers//2], tgt_mask=tgt_mask,
+            elif layer_id < 4:
+                mul_feat.append(feat_maps[(layer_id//2)])
+                mul_spatial_shape = mul_feat[0].shape
+                mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
+                mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
+
+                resized_memory = F.interpolate(memory, [mul_spatial_shape[2], mul_spatial_shape[3]], mode='bilinear', align_corners=False)
+                resized_memory = resized_memory.flatten(2).permute(2, 0, 1)
+                resized_memory = mul_feat + resized_memory
+
+                memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
+                pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
+
+            else:
+                mul_feat.append(feat_maps[(layer_id//2)])
+                mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
+                mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
+
+                resized_memory = memory.flatten(2).permute(2, 0, 1)
+                
+                resized_memory =  mul_feat + resized_memory #we should notice the feature map contains in a upside down manner.
+                memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
+                pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
+
+                
+        
+            #mul_feat = mul_feat.flatten(2).permute(2, 0, 1)
+            #mul_feat_pos = self.feat_input_proj_pos[(layer_id//2)](mul_feat)
+            #mul_feat_mem = self.feat_input_proj_mem[(layer_id//2)](mul_feat)
+
+            output = layer(output,resized_memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
                            memory_key_padding_mask=memory_key_padding_mask,
