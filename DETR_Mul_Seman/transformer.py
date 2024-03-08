@@ -18,14 +18,12 @@ import math
 import copy
 import os
 from typing import Optional, List
-import numpy as np
 from util.misc import inverse_sigmoid
 
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from .attention import MultiheadAttention
-from .ops.modules import MSDeformAttn
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -70,64 +68,30 @@ def gen_sineembed_for_position(pos_tensor):
     return pos
 
 
-class FPN(nn.Module):
-    def __init__(self, in_channels_list, out_channels):
-        super(FPN, self).__init__()
-        self.in_channels = in_channels_list  # List of channels for each feature layer C3, C4, C5
-        
-        # Lateral layers for each input feature map
-        self.lateral_layers = nn.ModuleList([nn.Conv2d(in_channels, out_channels, kernel_size=1)
-                                             for in_channels in self.in_channels])
-
-        # Output conv layers for the pyramid
-        self.output_layers = nn.ModuleList([nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-                                            for _ in self.in_channels])
-
-    def forward(self, x):
-        # Assume x is a list of three feature maps
-        c3, c4, c5 = x
-
-        # Apply the lateral layers
-        l3 = self.lateral_layers[0](c3)
-        l4 = self.lateral_layers[1](c4)
-        l5 = self.lateral_layers[2](c5)
-
-        # Start the top-down pathway and add the top layer to the output list
-        p5 = l5
-        out = [p5]
-
-        # Add P4 to the output list
-        p4 = self._upsample_add(l4, p5)
-        out.insert(0, self.output_layers[1](p4))
-
-        # Add P3 to the output list
-        p3 = self._upsample_add(l3, p4)
-        out.insert(0, self.output_layers[0](p3))
-
-        return out
-
-    def _upsample_add(self, x, y):
-        """Upsample and add two feature maps."""
-        _, _, H, W = x.size()
-        return F.interpolate(y, size=(H, W), mode='nearest') + x
-
 class PAN(nn.Module):
-    def __init__(self, num_input, out_channels):
-        super().__init__()
-        # Upsampling layers are usually part of FPN, not PAN, hence not included here
-        # Downsample layer is not needed for traditional PAN
-        self._downsample = nn.ModuleList([nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding =1) for _ in range(num_input -1)])
-
-    def forward(self, p):
-        # Assume p is a list of three feature maps from the FPN output
-        p5, p4, p3 = p
+    def __init__(self, lvl, channels):
+        super().__init__()       
+        self.conv = nn.Conv2d(channels, channels, kernel_size = 3, stride = 3, padding = 0)
+        self.feat_proj_list = nn.ModuleList()
+        self.l = lvl
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        for i in range(lvl):
+            self.feat_proj_list.append(nn.Linear(int(channels * math.pow(2, (i + 1))), channels))
+        self.feat_proj_list.to(device)
         
-        # Up-sample and combine features with higher resolution features
-        n4 = self._downsample[0](p3) + p4
-        n5 = self._downsample[1](n4) + p5 
-        # Typically, you would return the enhanced feature maps
-        return [ p3, n4, n5]  # Return the original and two enhanced feature maps
+    def forward(self, feat, feat_maps):
 
+        feat_pyramid = [feat]
+        for i in range(self.l - 1):
+            f = F.interpolate(feat_pyramid[i], scale_factor=2, mode='bilinear', align_corners=False) + self.feat_proj_list[i](feat_maps[self.l - i - 1])
+            feat_pyramid.append(f)
+
+        output = [feat_pyramid[-1]]
+        for i in range(self.l - 1):
+            output.append(output[i] + self.conv(feat_pyramid[self.l - i]))
+
+
+        return output
 
 
 class Transformer(nn.Module):
@@ -157,10 +121,15 @@ class Transformer(nn.Module):
                                           d_model=d_model, query_dim=query_dim, keep_query_pos=keep_query_pos, query_scale_type=query_scale_type,
                                           modulate_hw_attn=modulate_hw_attn,
                                           bbox_embed_diff_each_layer=bbox_embed_diff_each_layer)
-        in_channels_list = [256, 1024, 512]
-        out_channels = 256
-        self.fpn = FPN(in_channels_list, out_channels)
-        self.pan = PAN(len(in_channels_list), out_channels)
+        
+        
+        #self.feat_proj_list = nn.ModuleList()
+        #for i in range(2):
+        #    self.feat_proj_list.append(nn.Linear(int(d_model * math.pow(2, (i + 1))), d_model))   #project channels of feature maps into d_model
+        #                                                                                     # now we just write this by pior experience, how to implement it to meet very situation
+        #self.pooling = nn.MaxPool2d(kernel_size = 2, stride = 2, ceil_mode=True)
+        #self.attn = nn.MultiheadAttention(d_model, 8, dropout=dropout)
+        #self.mul_feat_proj = nn.Linear(d_model * 3, d_model)
 
         self._reset_parameters()
         assert query_scale_type in ['cond_elewise', 'cond_scalar', 'fix_elewise']
@@ -180,31 +149,25 @@ class Transformer(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-                
 
-    def forward(self, src, mask, refpoint_embed, pos_embed, tgt, attn_mask=None, feat_maps = None, masks = None):
+    def forward(self, src, mask, refpoint_embed, pos_embeds, tgt, attn_mask=None, feat_maps = None, masks = None):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
+        spatial_shape = src.shape
         src = src.flatten(2).permute(2, 0, 1)
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        pos_embed = pos_embeds[-1].flatten(2).permute(2, 0, 1)
         # refpoint_embed = refpoint_embed.unsqueeze(1).repeat(1, bs, 1)
-        mask = mask.flatten(1)   #for encoder
-        mul_feat_fpn = []
-        mul_feat_pan = []
+        mask = mask.flatten(1)
+    
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-
-        #implement of fpn
-        feat = memory.reshape(bs, c, h, w)
-        mul_feat = [feat, feat_maps[1], feat_maps[0]]
-        mul_feat_fpn = self.fpn(mul_feat)
-        mul_feat_pan = self.pan(mul_feat_fpn)
-
+        
         if self.num_patterns > 0:
             l = tgt.shape[0]
             tgt[l - self.num_queries * self.num_patterns:] += \
                 self.patterns.weight[:, None, None, :].repeat(1, self.num_queries, bs, 1).flatten(0, 1)
-        hs, references = self.decoder(tgt, mul_feat_pan, tgt_mask=attn_mask, memory_key_padding_mask=masks,      #how to solve mask issue?
-                          pos=pos_embed, refpoints_unsigmoid=refpoint_embed)
+
+        hs, references = self.decoder(tgt, memory, tgt_mask=attn_mask, memory_key_padding_masks=masks,
+                          pos=pos_embeds, refpoints_unsigmoid=refpoint_embed, feat_maps = feat_maps, spatial_shape = spatial_shape)
         return hs, references
 
 
@@ -261,8 +224,17 @@ class TransformerDecoder(nn.Module):
         else:
             raise NotImplementedError("Unknown query_scale_type: {}".format(query_scale_type))
         
+
+        self.feat_input_proj_list = nn.ModuleList()
+        for i in range(3):
+            self.feat_input_proj_list.append(nn.Linear(int(d_model * math.pow(2, (i + 1))), d_model))   #project channels of feature maps into d_model
+                                                                                                        # now we just write this by pior experience, how to implement it to meet very situation
+        #self.pooling = nn.MaxPool2d(kernel_size = 2, stride = 2, ceil_mode=True)
+        #self.L_proj = nn.Linear(d_model, d_model)
+        #self.fus_attn = MultiheadAttention(d_model, 8)
+
         self.ref_point_head = MLP(query_dim // 2 * d_model, d_model, d_model, 2)
-        #
+        
         self.bbox_embed = None
         self.d_model = d_model
         self.modulate_hw_attn = modulate_hw_attn
@@ -280,20 +252,22 @@ class TransformerDecoder(nn.Module):
             
                 
 
-    def forward(self, tgt, mul_feat_pan,
+    def forward(self, tgt, memory,
                 tgt_mask: Optional[Tensor] = None,
                 memory_mask: Optional[Tensor] = None,
                 tgt_key_padding_mask: Optional[Tensor] = None,
-                memory_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_masks: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 refpoints_unsigmoid: Optional[Tensor] = None, # num_queries, bs, 2
-                ):
+                feat_maps = None, spatial_shape = None):
         output = tgt
 
         intermediate = []
         reference_points = refpoints_unsigmoid.sigmoid()
         ref_points = [reference_points]
+        memory = memory.reshape(spatial_shape[0], spatial_shape[1], spatial_shape[2], spatial_shape[3])
         
+        assert feat_maps is not None
 
 
         # import ipdb; ipdb.set_trace()        
@@ -317,22 +291,66 @@ class TransformerDecoder(nn.Module):
             query_sine_embed = query_sine_embed[...,:self.d_model] * pos_transformation
 
             # modulated HW attentions
-            if self.modulate_hw_attn and layer_id >= 4:
+            if self.modulate_hw_attn:
                 refHW_cond = self.ref_anchor_head(output).sigmoid() # nq, bs, 2
                 query_sine_embed[..., self.d_model // 2:] *= (refHW_cond[..., 0] / obj_center[..., 2]).unsqueeze(-1)
                 query_sine_embed[..., :self.d_model // 2] *= (refHW_cond[..., 1] / obj_center[..., 3]).unsqueeze(-1)
-            
-            memory = mul_feat_pan[(layer_id//2)]
-            (_, _ , h, w) = memory.shape
-            spatial_shape = torch.tensor([[h, w]], device=memory.device)
+
+            p = PAN(3, self.d_model)
+            pan_feats = p(memory, feat_maps) 
+            #mul_feat = []
+            ##mul_feat = feat_maps[(layer_id//2)]
+            ##we also need to use different masks here! 
+            #if layer_id < 2:
+            #    mul_feat.append(feat_maps[(layer_id//2)])
+            #    mul_spatial_shape = mul_feat[0].shape
+            #    mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
+            #    mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
+        #
+            #    resized_memory = F.interpolate(memory, [mul_spatial_shape[2], mul_spatial_shape[3]], mode='bilinear', align_corners=False)# Double the spatial size
+            #    resized_memory = resized_memory.flatten(2).permute(2, 0, 1)
+            #    resized_memory = mul_feat + resized_memory
+#
+            #    memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
+            #    pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
+#
+            #elif layer_id < 4:
+            #    mul_feat.append(feat_maps[(layer_id//2)])
+            #    mul_spatial_shape = mul_feat[0].shape
+            #    mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
+            #    mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
+#
+            #    resized_memory = F.interpolate(memory, [mul_spatial_shape[2], mul_spatial_shape[3]], mode='bilinear', align_corners=False)
+            #    resized_memory = resized_memory.flatten(2).permute(2, 0, 1)
+            #    resized_memory = mul_feat + resized_memory
+#
+            #    memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
+            #    pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
+#
+            #else:
+            #    mul_feat.append(feat_maps[(layer_id//2)])
+            #    mul_feat = mul_feat[0].flatten(2).permute(2, 0, 1)
+            #    mul_feat = self.feat_input_proj_list[(layer_id//2)](mul_feat)
+#
+            #    resized_memory = memory.flatten(2).permute(2, 0, 1)
+            #    
+            #    resized_memory =  mul_feat + resized_memory #we should notice the feature map contains in a upside down manner.
+            #    memory_key_padding_mask = memory_key_padding_masks[(layer_id//2)].flatten(1)
+            #    pos_mul =  pos[layer_id//2].flatten(2).permute(2, 0, 1) 
+#
+            #    
+        #
+            ##mul_feat = mul_feat.flatten(2).permute(2, 0, 1)
+            ##mul_feat_pos = self.feat_input_proj_pos[(layer_id//2)](mul_feat)
+            ##mul_feat_mem = self.feat_input_proj_mem[(layer_id//2)](mul_feat)
 
 
-            output = layer(output, memory, tgt_mask=tgt_mask, 
-                           reference_points = reference_points, spatial_shape = spatial_shape, 
+            output = layer(output, pan_feats[layers//2], tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
-                           memory_key_padding_mask=memory_key_padding_mask[(layer_id//2)],
-                           pos=pos, query_pos=query_pos, query_sine_embed=query_sine_embed)
+                           memory_key_padding_mask=memory_key_padding_mask,
+                           pos=pos_mul, query_pos=query_pos, query_sine_embed=query_sine_embed,
+                           is_first=(layer_id == 0))
 
             # itetgtr update
             if self.bbox_embed is not None:
@@ -413,7 +431,7 @@ class TransformerDecoderLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False, keep_query_pos=False,
-                 rm_self_attn_decoder=False, layer_id = 0):
+                 rm_self_attn_decoder=False):
         super().__init__()
         # Decoder Self-Attention
         if not rm_self_attn_decoder:
@@ -426,37 +444,25 @@ class TransformerDecoderLayer(nn.Module):
 
             self.norm1 = nn.LayerNorm(d_model)
             self.dropout1 = nn.Dropout(dropout)
-        
 
         # Decoder Cross-Attention
-        if layer_id < 4:
-            self.cross_attn = MSDeformAttn(d_model, n_levels = 1, n_heads = 8, n_points = 8)
-#
-        else:  
-            self.ca_qcontent_proj = nn.Linear(d_model, d_model)
-            self.ca_qpos_proj = nn.Linear(d_model, d_model)
-            self.ca_kcontent_proj = nn.Linear(d_model, d_model)
-            self.ca_kpos_proj = nn.Linear(d_model, d_model)
-            self.ca_v_proj = nn.Linear(d_model, d_model)
-            self.ca_qpos_sine_proj = nn.Linear(d_model, d_model)
-            self.cross_attn = MultiheadAttention(d_model*2, nhead, dropout=dropout, vdim=d_model)  #for different size of feat_maps we use different attn
+        self.ca_qcontent_proj = nn.Linear(d_model, d_model)
+        self.ca_qpos_proj = nn.Linear(d_model, d_model)
+        self.ca_kcontent_proj = nn.Linear(d_model, d_model)
+        self.ca_kpos_proj = nn.Linear(d_model, d_model)
+        self.ca_v_proj = nn.Linear(d_model, d_model)
+        self.ca_qpos_sine_proj = nn.Linear(d_model, d_model)
+        self.cross_attn = MultiheadAttention(d_model*2, nhead, dropout=dropout, vdim=d_model)
 
-        #self.ca_qcontent_proj = nn.Linear(d_model, d_model)
-        #self.ca_qpos_proj = nn.Linear(d_model, d_model)
-        #self.ca_kcontent_proj = nn.Linear(d_model, d_model)
-        #self.ca_kpos_proj = nn.Linear(d_model, d_model)
-        #self.ca_v_proj = nn.Linear(d_model, d_model)
-        #self.ca_qpos_sine_proj = nn.Linear(d_model, d_model)
-        #self.cross_attn = MultiheadAttention(d_model*2, nhead, dropout=dropout, vdim=d_model)
-        
-        self.layer_id = layer_id
         self.nhead = nhead
         self.rm_self_attn_decoder = rm_self_attn_decoder
+
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
+        #self.linear_m = nn.Linear(d_model, d_model)
 
         
         self.norm2 = nn.LayerNorm(d_model)
@@ -472,14 +478,13 @@ class TransformerDecoderLayer(nn.Module):
         return tensor if pos is None else tensor + pos
 
     def forward(self, tgt, memory,
-                     tgt_mask: Optional[Tensor] = None, 
-                     reference_points = None, spatial_shape = None,
+                     tgt_mask: Optional[Tensor] = None,
                      memory_mask: Optional[Tensor] = None,
                      tgt_key_padding_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
-                     query_sine_embed = None,
+                     query_sine_embed = None,                                          
                      is_first = False):
                      
         # ========== Begin of Self-Attention =============
@@ -505,81 +510,46 @@ class TransformerDecoderLayer(nn.Module):
             tgt = tgt + self.dropout1(tgt2)
             tgt = self.norm1(tgt)
 
-         #========== Begin of Cross-Attention =============
-         #Apply projections here
-         #shape: num_queries x batch_size x 256
-        if self.layer_id < 4:
-            level_start_index = torch.tensor([[0]], device=memory.device)    #only for single scale deformable attention
-            memory = memory.flatten(2).permute(0, 2, 1)
+        # ========== Begin of Cross-Attention =============
+        # Apply projections here
+        # shape: num_queries x batch_size x 256
+        #memory_p = self.linear_m(memory)
+        q_content = self.ca_qcontent_proj(tgt)
+        k_content = self.ca_kcontent_proj(memory)
+        v = self.ca_v_proj(memory)
 
-            memory_key_padding_mask = memory_key_padding_mask.flatten(1)
-            reference_points = reference_points.reshape(bs, -1  , 1, 4)
-            tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos).transpose(0, 1),
-                                reference_points,
-                                memory, spatial_shape, level_start_index, memory_key_padding_mask)
-            tgt = tgt + self.dropout2(tgt2.transpose(0, 1))
+        num_queries, bs, n_model = q_content.shape
+        hw, _, _ = k_content.shape
+
+
+        k_pos = self.ca_kpos_proj(pos)
+        #k_pos = self.ca_kpos_proj(pos) + memory_p
+
+        # For the first decoder layer, we concatenate the positional embedding predicted from 
+        # the object query (the positional embedding) into the original query (key) in DETR.
+        if is_first or self.keep_query_pos:
+            q_pos = self.ca_qpos_proj(query_pos)
+            q = q_content + q_pos
+            k = k_content + k_pos
         else:
-            memory = memory.flatten(2).permute(2, 0, 1)
-            memory_key_padding_mask = memory_key_padding_mask.flatten(1)
-            q_content = self.ca_qcontent_proj(tgt)
-            k_content = self.ca_kcontent_proj(memory)
-            v = self.ca_v_proj(memory)
-            num_queries, bs, n_model = q_content.shape
-            hw, _, _ = k_content.shape
-            k_pos = self.ca_kpos_proj(pos)
-
             q = q_content
             k = k_content
-            q = q.view(num_queries, bs, self.nhead, n_model//self.nhead)
-            query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
-            query_sine_embed = query_sine_embed.view(num_queries, bs, self.nhead, n_model//self.nhead)
-            q = torch.cat([q, query_sine_embed], dim=3).view(num_queries, bs, n_model * 2)
-            k = k.view(hw, bs, self.nhead, n_model//self.nhead)
-            k_pos = k_pos.view(hw, bs, self.nhead, n_model//self.nhead)
-            k = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)
-            tgt2 = self.cross_attn(query=q,
-                                key=k,
-                                value=v, attn_mask=memory_mask,
-                                key_padding_mask=memory_key_padding_mask)[0]
-            tgt = tgt + self.dropout2(tgt2)
-    
-        #memory = memory.flatten(2).permute(2, 0, 1)
-        #memory_key_padding_mask = memory_key_padding_mask.flatten(1)
-        #q_content = self.ca_qcontent_proj(tgt)
-        #k_content = self.ca_kcontent_proj(memory)
-        #v = self.ca_v_proj(memory)
-#
-        #num_queries, bs, n_model = q_content.shape
-        #hw, _, _ = k_content.shape
-#
-#
-        #k_pos = self.ca_kpos_proj(pos)
-        ##k_pos = self.ca_kpos_proj(pos) + memory_p
-#
-        ## For the first decoder layer, we concatenate the positional embedding predicted from 
-        ## the object query (the positional embedding) into the original query (key) in DETR.
-        #if is_first or self.keep_query_pos:
-        #    q_pos = self.ca_qpos_proj(query_pos)
-        #    q = q_content + q_pos
-        #    k = k_content + k_pos
-        #else:
-        #    q = q_content
-        #    k = k_content
-#
-        #q = q.view(num_queries, bs, self.nhead, n_model//self.nhead)
-        #query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
-        #query_sine_embed = query_sine_embed.view(num_queries, bs, self.nhead, n_model//self.nhead)
-        #q = torch.cat([q, query_sine_embed], dim=3).view(num_queries, bs, n_model * 2)
-        #k = k.view(hw, bs, self.nhead, n_model//self.nhead)
-        #k_pos = k_pos.view(hw, bs, self.nhead, n_model//self.nhead)
-        #k = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)
-#
-        #tgt2 = self.cross_attn(query=q,
-        #                           key=k,
-        #                           value=v, attn_mask=memory_mask,
-        #                           key_padding_mask=memory_key_padding_mask)[0]
-         #========== End of Cross-Attention =============
 
+        q = q.view(num_queries, bs, self.nhead, n_model//self.nhead)
+        query_sine_embed = self.ca_qpos_sine_proj(query_sine_embed)
+        query_sine_embed = query_sine_embed.view(num_queries, bs, self.nhead, n_model//self.nhead)
+        q = torch.cat([q, query_sine_embed], dim=3).view(num_queries, bs, n_model * 2)
+        k = k.view(hw, bs, self.nhead, n_model//self.nhead)
+        k_pos = k_pos.view(hw, bs, self.nhead, n_model//self.nhead)
+        k = torch.cat([k, k_pos], dim=3).view(hw, bs, n_model * 2)
+
+        tgt2 = self.cross_attn(query=q,
+                                   key=k,
+                                   value=v, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]               
+        # ========== End of Cross-Attention =============
+
+        tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
